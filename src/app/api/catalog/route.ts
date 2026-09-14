@@ -1,24 +1,37 @@
 import { NextResponse } from "next/server";
 import { liveCatalog, liveGetBySlug } from "@/lib/catalog";
 
-// Fully dynamic: the merged catalog is memoized in-process for 5s (catalog.ts
-// TTL) and busted instantly on admin saves, so an extra HTTP caching layer
-// here only ever served STALE prices/images to the browser. no-store keeps
-// every storefront fetch honest.
 export const dynamic = "force-dynamic";
 
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const slug = searchParams.get("slug");
-  if (slug) {
-    const product = await liveGetBySlug(slug);
+  try {
+    if (slug) {
+      const product = await liveGetBySlug(slug);
+      return NextResponse.json(
+        { products: product ? [product] : [] },
+        // Short edge cache + stale-while-revalidate so 20 concurrent product
+        // grids don't all hit Postgres at the same ms (was no-store → 53300).
+        { headers: { "Cache-Control": "public, s-maxage=30, stale-while-revalidate=60" } }
+      );
+    }
+    const products = await liveCatalog();
     return NextResponse.json(
-      { products: product ? [product] : [] },
-      { headers: { "Cache-Control": "no-store" } }
+      { products },
+      { headers: { "Cache-Control": "public, s-maxage=30, stale-while-revalidate=60" } }
     );
+  } catch (err) {
+    console.error("[api/catalog] error:", (err as Error).message);
+    // liveCatalog already falls back to static catalog; this is last resort.
+    try {
+      const { products } = await import("@/lib/data/products");
+      return NextResponse.json(
+        { products },
+        { headers: { "Cache-Control": "public, s-maxage=10, stale-while-revalidate=30" } }
+      );
+    } catch {
+      return NextResponse.json({ products: [] }, { headers: { "Cache-Control": "no-store" } });
+    }
   }
-  return NextResponse.json(
-    { products: await liveCatalog() },
-    { headers: { "Cache-Control": "no-store" } }
-  );
 }

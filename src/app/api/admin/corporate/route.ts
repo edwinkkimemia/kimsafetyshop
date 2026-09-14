@@ -14,11 +14,17 @@ const VALID = ["Pending", "Reviewing", "Approved", "Declined"];
 export async function GET() {
   const denied = await requireAdmin();
   if (denied) return denied;
-  const applications = (await listCorporateApplications()).map((a) => ({
-    ...a,
-    documents: JSON.parse(a.documents),
-  }));
-  return NextResponse.json({ applications });
+  try {
+    const rows = await listCorporateApplications().catch(() => [] as Awaited<ReturnType<typeof listCorporateApplications>>);
+    const applications = rows.map((a) => ({
+      ...a,
+      documents: JSON.parse(a.documents),
+    }));
+    return NextResponse.json({ applications });
+  } catch (err) {
+    console.error("[admin/corporate] error:", (err as Error).message);
+    return NextResponse.json({ applications: [] });
+  }
 }
 
 export async function PATCH(req: Request) {

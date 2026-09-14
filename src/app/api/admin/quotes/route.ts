@@ -11,24 +11,30 @@ export async function GET(req: Request) {
   const denied = await requireAdmin();
   if (denied) return denied;
 
-  const { searchParams } = new URL(req.url);
-  const id = searchParams.get("id");
-  if (id) {
-    const quote = await getQuoteById(id);
-    if (!quote) return NextResponse.json({ error: "Quote not found" }, { status: 404 });
-    const result = { ...quote, items: JSON.parse(quote.items) } as Record<string, unknown>;
-    if (quote.user_id && (!quote.email || !quote.phone)) {
-      const account = await getUserById(quote.user_id);
-      if (account) {
-        result.email = quote.email ?? account.email;
-        result.phone = quote.phone ?? account.phone ?? null;
+  try {
+    const { searchParams } = new URL(req.url);
+    const id = searchParams.get("id");
+    if (id) {
+      const quote = await getQuoteById(id).catch(() => undefined);
+      if (!quote) return NextResponse.json({ error: "Quote not found" }, { status: 404 });
+      const result = { ...quote, items: JSON.parse(quote.items) } as Record<string, unknown>;
+      if (quote.user_id && (!quote.email || !quote.phone)) {
+        const account = await getUserById(quote.user_id).catch(() => undefined);
+        if (account) {
+          result.email = quote.email ?? account.email;
+          result.phone = quote.phone ?? account.phone ?? null;
+        }
       }
+      return NextResponse.json({ quote: result });
     }
-    return NextResponse.json({ quote: result });
-  }
 
-  const quotes = (await listQuotes()).map((q) => ({ ...q, items: JSON.parse(q.items) }));
-  return NextResponse.json({ quotes });
+    const rows = await listQuotes().catch(() => [] as Awaited<ReturnType<typeof listQuotes>>);
+    const quotes = rows.map((q) => ({ ...q, items: JSON.parse(q.items) }));
+    return NextResponse.json({ quotes });
+  } catch (err) {
+    console.error("[admin/quotes] error:", (err as Error).message);
+    return NextResponse.json({ quotes: [] });
+  }
 }
 
 export async function POST(req: Request) {

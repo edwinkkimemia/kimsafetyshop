@@ -10,23 +10,35 @@ import { DEFAULT_SETTINGS } from "@/lib/settings-defaults";
 const CACHE_TTL_MS = 60 * 1000;
 
 let cached: { at: number; data: Record<string, string>; version: string } | null = null;
+let inflight: Promise<Record<string, string>> | null = null;
 
 export async function fetchSettings(force = false): Promise<Record<string, string>> {
   const now = Date.now();
   if (!force && cached && now - cached.at < CACHE_TTL_MS) return cached.data;
-  let data: Record<string, string>;
-  let version = "0";
+  // Deduplicate concurrent callers (store.tsx + useSettings both fire on mount
+  // at the same ms → previously 2× /api/settings; now 1× with shared promise).
+  if (inflight) return inflight;
+  inflight = (async () => {
+    let data: Record<string, string>;
+    let version = "0";
+    try {
+      const res = await fetch("/api/settings", { cache: "no-store" });
+      if (!res.ok) throw new Error(`settings ${res.status}`);
+      const json = await res.json().catch(() => ({}));
+      data = { ...DEFAULT_SETTINGS, ...(json.settings ?? {}) };
+      version = typeof json.version === "string" ? json.version : "0";
+    } catch {
+      if (cached) return cached.data;
+      data = { ...DEFAULT_SETTINGS };
+    }
+    cached = { at: Date.now(), data, version };
+    return data;
+  })();
   try {
-    const res = await fetch("/api/settings", { cache: "no-store" });
-    const json = await res.json().catch(() => ({}));
-    data = { ...DEFAULT_SETTINGS, ...(json.settings ?? {}) };
-    version = typeof json.version === "string" ? json.version : "0";
-  } catch {
-    if (cached) return cached.data;
-    data = { ...DEFAULT_SETTINGS };
+    return await inflight;
+  } finally {
+    inflight = null;
   }
-  cached = { at: now, data, version };
-  return data;
 }
 
 export function settingsVersion(): string {
@@ -54,17 +66,22 @@ export function useSettings(): Record<string, string> {
   const [settings, setSettings] = useState<Record<string, string>>(DEFAULT_SETTINGS);
   useEffect(() => {
     let active = true;
-    // Force a network fetch on mount so an updated logo/name is picked up
-    // immediately instead of after the TTL window.
-    fetchSettings(true).then((s) => {
+    // Respect TTL (60s) — force only on first mount if cache empty or stale.
+    // Previous `fetchSettings(true)` hammered /api/settings on every visibilitychange.
+    fetchSettings().then((s) => {
       if (active) setSettings(s);
     });
-    // Pick up cross-tab updates: another tab saved new settings.
+    // Pick up cross-tab / visibility updates, but respect TTL and debounce
+    // to avoid the 4× at 17:44:36 stampede when tab regains focus.
+    let visibleDebounce: ReturnType<typeof setTimeout> | null = null;
     const onVisible = () => {
       if (document.visibilityState !== "visible") return;
-      fetchSettings(true).then((s) => {
-        if (active) setSettings(s);
-      });
+      if (visibleDebounce) clearTimeout(visibleDebounce);
+      visibleDebounce = setTimeout(() => {
+        fetchSettings().then((s) => {
+          if (active) setSettings(s);
+        });
+      }, 2000);
     };
     const onStorage = (e: StorageEvent) => {
       if (e.key !== "kimsafety-settings-version") return;
@@ -76,6 +93,7 @@ export function useSettings(): Record<string, string> {
     window.addEventListener("storage", onStorage);
     return () => {
       active = false;
+      if (visibleDebounce) clearTimeout(visibleDebounce);
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("storage", onStorage);
     };

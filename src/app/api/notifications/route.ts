@@ -10,8 +10,18 @@ import { getSessionUser } from "@/lib/api-helpers";
 export async function GET() {
   const user = await getSessionUser();
   if (!user) return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
-  const [notifications, unread] = await Promise.all([listNotificationsForUser(user.id), countUnreadNotifications(user.id)]);
-  return NextResponse.json({ notifications, unread });
+  try {
+    // Consolidate to single client would be ideal, but Promise.all with 1 max pool queues;
+    // fallback to stale empty on 53300 so header badge doesn't spam retries.
+    const [notifications, unread] = await Promise.all([
+      listNotificationsForUser(user.id).catch(() => []),
+      countUnreadNotifications(user.id).catch(() => 0),
+    ]);
+    return NextResponse.json({ notifications, unread });
+  } catch (err) {
+    console.error("[notifications] error:", (err as Error).message);
+    return NextResponse.json({ notifications: [], unread: 0 });
+  }
 }
 
 export async function POST(req: Request) {

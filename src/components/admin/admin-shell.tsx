@@ -79,18 +79,34 @@ export function AdminShell({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     let alive = true;
+    let failures = 0;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const schedule = (ms: number) => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(load, ms);
+    };
     const load = () =>
       fetch("/api/admin/nav-badges")
-        .then((r) => (r.ok ? r.json() : null))
+        .then((r) => {
+          if (!r.ok) throw new Error(`nav-badges ${r.status}`);
+          return r.json();
+        })
         .then((d) => {
           if (alive && d?.badges) setBadges(d.badges);
+          failures = 0;
+          schedule(60000);
         })
-        .catch(() => {});
+        .catch(() => {
+          failures += 1;
+          // Back off on 53300 / 500 burst: 1m → 2m → 4m max 5m, avoids hammering DB.
+          const backoff = Math.min(60000 * Math.pow(2, failures), 300000);
+          const jitter = backoff * 0.2 * Math.random();
+          schedule(backoff + jitter);
+        });
     load();
-    const t = setInterval(load, 60000);
     return () => {
       alive = false;
-      clearInterval(t);
+      if (timer) clearTimeout(timer);
     };
   }, []);
 

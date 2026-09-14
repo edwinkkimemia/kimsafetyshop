@@ -27,8 +27,14 @@ function parseBody(body: unknown): PostInput | null {
 export async function GET() {
   const denied = await requireAdmin();
   if (denied) return denied;
-  const posts = (await listPosts(true)).map((p) => ({ ...p, published: Boolean(p.published) }));
-  return NextResponse.json({ posts });
+  try {
+    const rows = await listPosts(true).catch(() => [] as Awaited<ReturnType<typeof listPosts>>);
+    const posts = rows.map((p) => ({ ...p, published: Boolean(p.published) }));
+    return NextResponse.json({ posts });
+  } catch (err) {
+    console.error("[admin/posts] error:", (err as Error).message);
+    return NextResponse.json({ posts: [] });
+  }
 }
 
 export async function POST(req: Request) {

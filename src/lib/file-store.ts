@@ -22,6 +22,35 @@ export function sniffType(data: Buffer): string | null {
   return null;
 }
 
+// Small in-memory LRU for image BYTEA — avoids per-image DB hit on grid pages
+// (20 images = 20 concurrent SELECTs → 53300 with max:1). Cached per Lambda.
+const FILE_CACHE_TTL_MS = 60 * 1000;
+const FILE_CACHE_MAX = 100;
+const fileCache = new Map<string, { at: number; data: StoredFile | null }>();
+// Negative cache (null) avoids re-querying missing files every hit.
+let fileCacheInflight = new Map<string, Promise<StoredFile | undefined>>();
+
+function cacheGet(key: string): StoredFile | undefined | null | undefined {
+  // return undefined = miss, null = negative hit, StoredFile = hit
+  const hit = fileCache.get(key);
+  if (!hit) return undefined;
+  if (Date.now() - hit.at > FILE_CACHE_TTL_MS) {
+    fileCache.delete(key);
+    return undefined;
+  }
+  // LRU touch
+  fileCache.delete(key);
+  fileCache.set(key, hit);
+  return hit.data;
+}
+function cacheSet(key: string, value: StoredFile | null) {
+  if (fileCache.size >= FILE_CACHE_MAX) {
+    const first = fileCache.keys().next().value as string | undefined;
+    if (first) fileCache.delete(first);
+  }
+  fileCache.set(key, { at: Date.now(), data: value });
+}
+
 export async function saveStoredFile(filename: string, data: Buffer, mime?: string | null): Promise<void> {
   await qe(
     "INSERT INTO upload_files (filename, data, mime, size, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(filename) DO UPDATE SET data = excluded.data, mime = excluded.mime, size = excluded.size",
@@ -31,17 +60,42 @@ export async function saveStoredFile(filename: string, data: Buffer, mime?: stri
     data.length,
     new Date().toISOString()
   );
+  cacheSet(filename, { filename, data, mime: mime ?? null, size: data.length });
 }
 
 export async function getStoredFile(filename: string): Promise<StoredFile | undefined> {
-  const row = (await q1("SELECT filename, data, mime, size FROM upload_files WHERE filename = ?", filename)) as
-    | { filename: string; data: Buffer; mime: string | null; size: number }
-    | undefined;
-  return row;
+  const cached = cacheGet(filename);
+  if (cached !== undefined) return cached ?? undefined;
+  // Dedupe concurrent fetches for same filename (grid loads same image twice)
+  const inflight = fileCacheInflight.get(filename);
+  if (inflight) return inflight;
+  const p = (async () => {
+    try {
+      const row = (await q1("SELECT filename, data, mime, size FROM upload_files WHERE filename = ?", filename)) as
+        | { filename: string; data: Buffer; mime: string | null; size: number }
+        | undefined;
+      cacheSet(filename, row ?? null);
+      return row;
+    } catch (err) {
+      const msg = (err as Error)?.message ?? "";
+      const code = (err as { code?: string })?.code;
+      if (code === "53300" || /too many connections/i.test(msg)) {
+        // Under 53300 don't cache negative forever; fall through to fs
+        console.warn(`[file-store] getStoredFile 53300 fallback for ${filename}`);
+        return undefined;
+      }
+      throw err;
+    } finally {
+      fileCacheInflight.delete(filename);
+    }
+  })();
+  fileCacheInflight.set(filename, p);
+  return p;
 }
 
 export async function deleteStoredFile(filename: string): Promise<void> {
   await qe("DELETE FROM upload_files WHERE filename = ?", filename);
+  fileCache.delete(filename);
 }
 
 export async function listStoredFiles(): Promise<string[]> {

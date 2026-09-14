@@ -197,7 +197,11 @@ export type DbNotification = {
   created_at: string;
 };
 
-let pool: Pool | null = null;
+// Use globalThis so HMR / Vercel lambda reuse doesn't create extra pools.
+// Without this, each hot-reload or concurrent lambda can leak a Pool (=2 conns).
+const globalForPg = globalThis as unknown as { __kimsafetyPool?: Pool | null };
+
+let pool: Pool | null = globalForPg.__kimsafetyPool ?? null;
 
 export function getDb(): Pool {
   if (!pool) {
@@ -220,14 +224,39 @@ export function getDb(): Pool {
       host = new URL(url).hostname;
     } catch {}
     const ssl = /sslmode=require|sslmode=verify-full/.test(url) || !["localhost", "127.0.0.1", "::1"].includes(host);
+    // Serverless (Vercel) note: each concurrent Lambda isolate holds its own Pool.
+    // With max:2 and 10 concurrent Lambdas you need 20 Postgres connections, but
+    // the `prisma_migration` role is often limited to ~10. That is the
+    // "too many connections for role prisma_migration" (53300) you see in logs.
+    // Fix: keep max at 1 on Vercel (override with DATABASE_POOL_MAX) and use
+    // the *pooled* Postgres host (Neon/Supabase pooler, e.g. ep-xxx-pooler... or
+    // host:6543 / ?pgbouncer=true). The warning below fires when a direct host
+    // is used in production.
+    const isVercel = !!process.env.VERCEL;
+    const poolMax = Number(process.env.DATABASE_POOL_MAX) || (isVercel ? 1 : 2);
+    const hasPoolerHint =
+      /pooler|pgbouncer=true/i.test(url) || /:6543\b/.test(url);
+    if (isVercel && !hasPoolerHint && !host.includes("localhost") && !host.includes("127.0.0.1")) {
+      console.warn(
+        "[kimsafety] DATABASE_URL looks like a direct Postgres host. On Vercel, switch to the pooled connection string (Neon: add '-pooler' to hostname or use port 6543, append ?pgbouncer=true&connection_limit=1) to avoid 53300 too-many-connections."
+      );
+    }
     pool = new Pool({
       connectionString: url,
       ssl: ssl ? { rejectUnauthorized: false } : false,
-      max: 2,
-      connectionTimeoutMillis: 8000,
-      idleTimeoutMillis: 15000,
+      max: poolMax,
+      // Short timeouts so a saturated DB fails fast and falls back to cache /
+      // static catalog instead of hanging the Lambda for 8s and retrying.
+      connectionTimeoutMillis: 5000,
+      idleTimeoutMillis: 10000,
+      // Let the Lambda exit cleanly when idle; keeps idle conns from lingering.
+      allowExitOnIdle: true,
     });
     pool.on("error", (err: Error) => console.error("[kimsafety] pg pool error", err));
+    // Serverless: surface pool pressure in logs without crashing.
+    // Remove listeners on HMR re-create to avoid duplicates.
+    if (process.env.NODE_ENV !== "production") globalForPg.__kimsafetyPool = pool;
+    else globalForPg.__kimsafetyPool = pool;
   }
   return pool;
 }
@@ -261,13 +290,31 @@ function isTransientPgError(err: unknown): boolean {
   return false;
 }
 
+function isTooManyConnections(err: unknown): boolean {
+  const e = err as { code?: string; message?: string };
+  return e?.code === "53300" || /too many connections/i.test(e?.message ?? "");
+}
+
 async function runQuery<T>(text: string, values: unknown[], retries = 4): Promise<T> {
   try {
     const res = await getDb().query(text, values);
     return res as T;
   } catch (err) {
     if (retries > 0 && isTransientPgError(err)) {
-      await new Promise((r) => setTimeout(r, 800 * (5 - retries) + 200));
+      // 53300 (too many connections) is a capacity signal — hammering retries
+      // makes the stampede worse. Retry at most once with jitter, then bubble
+      // up so the caller can serve cached/static fallback instead of 500.
+      if (isTooManyConnections(err)) {
+        if (retries < 4) throw err; // only first 53300 gets one retry
+        const jitter = 400 + Math.random() * 600;
+        await new Promise((r) => setTimeout(r, jitter));
+        return runQuery<T>(text, values, retries - 1);
+      }
+      // Other transient errors (ECONNRESET etc.) keep the old backoff but
+      // capped to 2 retries to avoid tying up the Lambda.
+      const cappedRetries = Math.min(retries, 2);
+      if (cappedRetries !== retries) throw err;
+      await new Promise((r) => setTimeout(r, 600 * (3 - cappedRetries) + 200 + Math.random() * 300));
       return runQuery<T>(text, values, retries - 1);
     }
     throw err;
@@ -794,11 +841,22 @@ export async function getSetting(key: string): Promise<string> {
 export async function getAllSettings(): Promise<Record<string, string>> {
   const now = Date.now();
   if (settingsCache && now - settingsCache.at < SETTINGS_TTL_MS) return settingsCache.data;
-  const rows = (await qr("SELECT key, value FROM settings")) as { key: string; value: string }[];
-  const out: Record<string, string> = { ...DEFAULT_SETTINGS };
-  for (const r of rows) out[r.key] = r.value;
-  settingsCache = { at: now, data: out };
-  return out;
+  try {
+    const rows = (await qr("SELECT key, value FROM settings")) as { key: string; value: string }[];
+    const out: Record<string, string> = { ...DEFAULT_SETTINGS };
+    for (const r of rows) out[r.key] = r.value;
+    settingsCache = { at: now, data: out };
+    return out;
+  } catch (err) {
+    // On 53300 (too many connections) serve stale cache or defaults instead of 500.
+    // The route handler already expects this — it stringifies 500s into retries.
+    if (settingsCache) return settingsCache.data;
+    if (isTooManyConnections(err)) {
+      console.warn("[db] getAllSettings fallback to DEFAULT_SETTINGS due to too many connections");
+      return { ...DEFAULT_SETTINGS };
+    }
+    throw err;
+  }
 }
 
 const SETTINGS_TTL_MS = 60 * 1000;
@@ -820,6 +878,81 @@ export async function getSettingsVersion(): Promise<string> {
     return row?.v ?? "0";
   } catch {
     return "0";
+  }
+}
+
+// Consolidated fetch for /api/settings — uses a single pooled client so the
+// two SELECTs don't occupy two connections concurrently. Falls back to cache
+// on 53300.
+export async function getSettingsWithVersion(): Promise<{ settings: Record<string, string>; version: string }> {
+  const now = Date.now();
+  if (settingsCache && now - settingsCache.at < SETTINGS_TTL_MS) {
+    try {
+      const vRow = (await q1("SELECT MAX(updated_at) AS v FROM settings")) as { v: string | null } | undefined;
+      return { settings: settingsCache.data, version: vRow?.v ?? "0" };
+    } catch {
+      return { settings: settingsCache.data, version: "0" };
+    }
+  }
+  // Use a single client for both queries to avoid 2 concurrent connections.
+  let client: import("pg").PoolClient | null = null;
+  try {
+    client = await getDb().connect();
+    const [sRes, vRes] = await Promise.all([
+      client.query("SELECT key, value FROM settings"),
+      client.query("SELECT MAX(updated_at) AS v FROM settings"),
+    ]);
+    const out: Record<string, string> = { ...DEFAULT_SETTINGS };
+    for (const r of (sRes.rows as { key: string; value: string }[])) out[r.key] = r.value;
+    settingsCache = { at: now, data: out };
+    const version = (vRes.rows[0] as { v: string | null })?.v ?? "0";
+    return { settings: out, version };
+  } catch (err) {
+    if (settingsCache) return { settings: settingsCache.data, version: "0" };
+    if (isTooManyConnections(err)) {
+      console.warn("[db] getSettingsWithVersion fallback due to too many connections");
+      return { settings: { ...DEFAULT_SETTINGS }, version: "0" };
+    }
+    throw err;
+  } finally {
+    if (client) client.release();
+  }
+}
+
+// Single-query nav badges — replaces 6 parallel COUNT(*) queries with one round-trip.
+// Critical for 53300: 6× Promise.all held 2 connections + queue depth per request.
+export async function getNavBadgeCounts(): Promise<{ orders: number; tickets: number; quotes: number; returns: number; questions: number; messages: number }> {
+  try {
+    const row = (await q1<{
+      orders: number;
+      tickets: number;
+      quotes: number;
+      returns: number;
+      questions: number;
+      messages: number;
+    }>(`
+      SELECT
+        (SELECT COUNT(*)::int FROM orders WHERE status = 'Processing') AS orders,
+        (SELECT COUNT(*)::int FROM support_tickets WHERE status = 'Open') AS tickets,
+        (SELECT COUNT(*)::int FROM quotes WHERE status = 'Pending') AS quotes,
+        (SELECT COUNT(*)::int FROM returns WHERE status = 'Requested') AS returns,
+        (SELECT COUNT(*)::int FROM product_questions WHERE answer IS NULL) AS questions,
+        (SELECT COUNT(*)::int FROM contact_messages) AS messages
+    `)) as { orders: number; tickets: number; quotes: number; returns: number; questions: number; messages: number } | undefined;
+    return {
+      orders: row?.orders ?? 0,
+      tickets: row?.tickets ?? 0,
+      quotes: row?.quotes ?? 0,
+      returns: row?.returns ?? 0,
+      questions: row?.questions ?? 0,
+      messages: row?.messages ?? 0,
+    };
+  } catch (err) {
+    if (isTooManyConnections(err)) {
+      console.warn("[db] getNavBadgeCounts fallback to zeros due to too many connections");
+      return { orders: 0, tickets: 0, quotes: 0, returns: 0, questions: 0, messages: 0 };
+    }
+    throw err;
   }
 }
 

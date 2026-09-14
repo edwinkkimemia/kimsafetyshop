@@ -17,11 +17,16 @@ export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const activeOnly = searchParams.get("active") === "1";
 
-  const [subscribers, count] = await Promise.all([
-    listNewsletterSubscribers(activeOnly),
-    countNewsletterSubscribers(),
-  ]);
-  return NextResponse.json({ subscribers, count });
+  try {
+    // Single-query consolidation: COUNT(*) can be derived from subscribers length on small lists,
+    // but for correctness keep 2 calls with 53300 fallback — sequential to avoid 2 conns.
+    const subscribers = await listNewsletterSubscribers(activeOnly).catch(() => [] as Awaited<ReturnType<typeof listNewsletterSubscribers>>);
+    const count = await countNewsletterSubscribers().catch(() => 0);
+    return NextResponse.json({ subscribers, count });
+  } catch (err) {
+    console.error("[admin/newsletter] error:", (err as Error).message);
+    return NextResponse.json({ subscribers: [], count: 0 });
+  }
 }
 
 /** Manually adds a subscriber (email, with optional name) from the admin panel. */

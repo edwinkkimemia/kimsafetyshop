@@ -115,8 +115,13 @@ export async function GET() {
     dbFiles = rows.filter((r) => IMAGE_RE.test(r.filename) && !blocked.has(r.filename));
   } catch (err) {
     const code = (err as { code?: string })?.code;
-    if (code !== "42P01") throw err;
-    dbFiles = [];
+    const msg = (err as Error)?.message ?? "";
+    // 53300 too many connections -> serve filesystem-only instead of 500
+    if (code === "42P01") dbFiles = [];
+    else if (code === "53300" || /too many connections/i.test(msg)) {
+      console.warn("[admin/media] dbFiles fallback to filesystem due to 53300");
+      dbFiles = [];
+    } else throw err;
   }
 
   // Filter blocked from filesystem lists so deleted images don't reappear after reload
@@ -149,7 +154,7 @@ export async function GET() {
   // --- Admin product references ---
   const adminRefMap = new Map<string, { sku: string; name?: string; field: string }[]>();
   try {
-    const adminRows = await listAdminProducts();
+    const adminRows = await listAdminProducts().catch(() => [] as Awaited<ReturnType<typeof listAdminProducts>>);
     for (const row of adminRows) {
       const data = JSON.parse(String(row.data)) as Record<string, unknown> & { sku: string; name?: string; image?: string; gallery?: string[] };
       const sku = data.sku;
@@ -169,7 +174,9 @@ export async function GET() {
         for (const g of data.gallery) check(g, "gallery");
       }
     }
-  } catch {}
+  } catch {
+    // 53300 -> empty refs is fine
+  }
 
   // --- Merge all files into map by filename ---
   const map = new Map<string, MediaItem>();

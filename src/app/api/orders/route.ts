@@ -13,33 +13,35 @@ import { rateLimit, tooMany } from "@/lib/rate-limit";
 export async function GET(req: Request) {
   const user = await getSessionUser();
   if (!user) return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
-  const { searchParams } = new URL(req.url);
-  const id = searchParams.get("id");
-  const catalog = await liveCatalog();
-  const byId = new Map(catalog.map((p) => [p.id, p] as const));
-  const enrich = async (o: Awaited<ReturnType<typeof ordersForUser>>[number]) => ({
-    ...o,
-    items: JSON.parse(o.items).map((i: { productId: string; qty: number; name?: string; price?: number }) => {
-      const p = byId.get(i.productId);
-      return {
-        ...i,
-        name: i.name || (p?.name ?? i.productId),
-        sku: p?.sku,
-        // The stored purchase price is authoritative — history must not
-        // reprice when the admin later edits catalog prices.
-        price: typeof i.price === "number" && i.price > 0 ? i.price : p ? bulkUnitPrice(p, i.qty) : undefined,
-        datasheetIndex: p?.downloads?.findIndex((d) => /datasheet/i.test(d.name || "")),
-      };
-    }),
-  });
-  if (id) {
-    const order = await getOrderById(id);
-    if (!order || order.user_id !== user.id) return NextResponse.json({ error: "Order not found" }, { status: 404 });
-    return NextResponse.json({ order: await enrich(order) });
+  try {
+    const catalog = await liveCatalog().catch(() => [] as Awaited<ReturnType<typeof liveCatalog>>);
+    const byId = new Map(catalog.map((p) => [p.id, p] as const));
+    const enrich = async (o: Awaited<ReturnType<typeof ordersForUser>>[number]) => ({
+      ...o,
+      items: JSON.parse(o.items).map((i: { productId: string; qty: number; name?: string; price?: number }) => {
+        const p = byId.get(i.productId);
+        return {
+          ...i,
+          name: i.name || (p?.name ?? i.productId),
+          sku: p?.sku,
+          price: typeof i.price === "number" && i.price > 0 ? i.price : p ? bulkUnitPrice(p, i.qty) : undefined,
+          datasheetIndex: p?.downloads?.findIndex((d) => /datasheet/i.test(d.name || "")),
+        };
+      }),
+    });
+    const id = new URL(req.url).searchParams.get("id");
+    if (id) {
+      const order = await getOrderById(id).catch(() => undefined);
+      if (!order || order.user_id !== user.id) return NextResponse.json({ error: "Order not found" }, { status: 404 });
+      return NextResponse.json({ order: await enrich(order) });
+    }
+    const rawOrders = await ordersForUser(user.id).catch(() => [] as Awaited<ReturnType<typeof ordersForUser>>);
+    const orders = await Promise.all(rawOrders.map(enrich));
+    return NextResponse.json({ orders }, { headers: { "Cache-Control": "no-store" } });
+  } catch (err) {
+    console.error("[api/orders] GET error:", (err as Error).message);
+    return NextResponse.json({ orders: [] }, { headers: { "Cache-Control": "no-store" } });
   }
-  const rawOrders = await ordersForUser(user.id);
-  const orders = await Promise.all(rawOrders.map(enrich));
-  return NextResponse.json({ orders });
 }
 
 type OrderItem = { productId: string; qty: number; price?: number };

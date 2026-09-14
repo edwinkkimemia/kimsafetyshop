@@ -34,7 +34,13 @@ function parseCampaign(
 export async function GET() {
   const denied = await requireAdmin();
   if (denied) return denied;
-  return NextResponse.json({ campaigns: (await listCampaigns()).map((c) => ({ ...c, active: Boolean(c.active) })) });
+  try {
+    const rows = await listCampaigns().catch(() => [] as Awaited<ReturnType<typeof listCampaigns>>);
+    return NextResponse.json({ campaigns: rows.map((c) => ({ ...c, active: Boolean(c.active) })) });
+  } catch (err) {
+    console.error("[admin/campaigns] error:", (err as Error).message);
+    return NextResponse.json({ campaigns: [] });
+  }
 }
 
 export async function POST(req: Request) {

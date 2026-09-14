@@ -53,7 +53,13 @@ async function maybeNotifyRestock(sku: string, stock: number, name: string, slug
 export async function GET() {
   const denied = await requireAdmin();
   if (denied) return denied;
-  return NextResponse.json({ products: await mergedCatalog() });
+  try {
+    const products = await mergedCatalog().catch(() => [] as Awaited<ReturnType<typeof mergedCatalog>>);
+    return NextResponse.json({ products });
+  } catch (err) {
+    console.error("[admin/products] error:", (err as Error).message);
+    return NextResponse.json({ products: [] });
+  }
 }
 
 export async function POST(req: Request) {

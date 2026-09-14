@@ -119,12 +119,20 @@ export const viewport: Viewport = {
   themeColor: "#0F2847",
 };
 
+export const revalidate = 60;
+
 export default async function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  const [brand, count] = await Promise.all([loadBrand(), productCount()]);
+  // Sequential to avoid 2 concurrent DB connections on cold Lambda (max:1).
+  // Both helpers are cached (settings 60s, catalog 30s) so after first hit no DB.
+  const brand = await loadBrand();
+  const count = await productCount().catch(() => {
+    const { products } = require("@/lib/data/products");
+    return products.length;
+  });
 
   const organizationJsonLd = {
     "@context": "https://schema.org",

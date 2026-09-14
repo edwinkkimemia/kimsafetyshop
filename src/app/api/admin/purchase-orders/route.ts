@@ -7,7 +7,13 @@ export const runtime = "nodejs";
 export async function GET() {
   const denied = await requireAdmin();
   if (denied) return denied;
-  return NextResponse.json({ purchaseOrders: await listPurchaseOrders() });
+  try {
+    const purchaseOrders = await listPurchaseOrders().catch(() => [] as Awaited<ReturnType<typeof listPurchaseOrders>>);
+    return NextResponse.json({ purchaseOrders });
+  } catch (err) {
+    console.error("[admin/purchase-orders] error:", (err as Error).message);
+    return NextResponse.json({ purchaseOrders: [] });
+  }
 }
 
 export async function PATCH(req: Request) {

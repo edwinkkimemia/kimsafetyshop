@@ -5,7 +5,13 @@ import { answerQuestion, deleteQuestion, listAllQuestions } from "@/lib/db";
 export async function GET() {
   const denied = await requireAdmin();
   if (denied) return denied;
-  return NextResponse.json({ questions: await listAllQuestions() });
+  try {
+    const questions = await listAllQuestions().catch(() => [] as Awaited<ReturnType<typeof listAllQuestions>>);
+    return NextResponse.json({ questions });
+  } catch (err) {
+    console.error("[admin/questions] error:", (err as Error).message);
+    return NextResponse.json({ questions: [] });
+  }
 }
 
 export async function PATCH(req: Request) {

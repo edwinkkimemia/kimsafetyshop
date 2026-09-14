@@ -71,11 +71,14 @@ export default function CheckoutPage() {
     prefillDone.current = true;
     const urlRef = new URLSearchParams(window.location.search).get("ref");
     if (urlRef?.trim()) setReferral(urlRef.trim());
-    Promise.all([
-      fetch("/api/auth/session").then((r) => r.json()).catch(() => ({})),
-      fetch("/api/addresses").then((r) => (r.ok ? r.json() : { addresses: [] })).catch(() => ({ addresses: [] })),
-      fetch("/api/orders").then((r) => (r.ok ? r.json() : { orders: [] })).catch(() => ({ orders: [] })),
-    ]).then(([sess, addrData, ordData]) => {
+    // Sequential to avoid 3 concurrent DB connections on checkout mount (was Promise.all).
+    // Stagger slightly so they don't all land at same ms as /api/settings + /api/catalog.
+    (async () => {
+      const sess = await fetch("/api/auth/session").then((r) => r.json()).catch(() => ({}));
+      const addrData = await fetch("/api/addresses").then((r) => (r.ok ? r.json() : { addresses: [] })).catch(() => ({ addresses: [] }));
+      const ordData = await fetch("/api/orders").then((r) => (r.ok ? r.json() : { orders: [] })).catch(() => ({ orders: [] }));
+      return [sess, addrData, ordData] as const;
+    })().then(([sess, addrData, ordData]) => {
       const user = (sess as { user?: { name?: string; email?: string; phone?: string | null; role?: string } }).user;
       if (user) setSignedIn(true);
       if (user?.role === "admin" || user?.role === "superadmin") {
@@ -213,9 +216,8 @@ export default function CheckoutPage() {
   };
 
   // Poll the M-Pesa status endpoint until the STK callback confirms payment.
-  // Stops early on a decline (the callback result is surfaced via the status
-  // endpoint) or after 2 minutes — either way the customer gets a "Resend STK
-  // push" option instead of a dead end.
+  // Stops early on a decline or after 2 minutes. Interval 5s (was 3s) to avoid
+  // hammering Postgres under burst (3s × many checkouts = 53300).
   useEffect(() => {
     if (!placed || payment !== "mpesa" || paidNow || pollDone) return;
     let cancelled = false;
@@ -224,6 +226,10 @@ export default function CheckoutPage() {
         const r = await fetch(`/api/orders/status?orderId=${encodeURIComponent(orderId ?? "")}&token=${encodeURIComponent(paymentToken ?? "")}`);
         const j = await r.json();
         if (cancelled) return;
+        if (j.transient) {
+          // DB overloaded (53300) — back off silently, keep polling
+          return;
+        }
         if (j.paid === 1) {
           setPaidNow(true);
           setPaidRef(j.transactionId ?? null);
@@ -243,7 +249,7 @@ export default function CheckoutPage() {
       } catch {
         /* transient network error — keep polling */
       }
-    }, 3000);
+    }, 5000);
     const timeout = setTimeout(() => {
       if (!cancelled) {
         setPollDone(true);

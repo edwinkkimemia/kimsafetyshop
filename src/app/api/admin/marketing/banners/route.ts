@@ -39,7 +39,13 @@ function parseBanner(body: unknown): (Omit<MarketingBanner, "id" | "created_at" 
 export async function GET() {
   const denied = await requireAdmin();
   if (denied) return denied;
-  return NextResponse.json({ banners: (await listBanners()).map((b) => ({ ...b, active: Boolean(b.active) })) });
+  try {
+    const rows = await listBanners().catch(() => [] as Awaited<ReturnType<typeof listBanners>>);
+    return NextResponse.json({ banners: rows.map((b) => ({ ...b, active: Boolean(b.active) })) });
+  } catch (err) {
+    console.error("[admin/banners] error:", (err as Error).message);
+    return NextResponse.json({ banners: [] });
+  }
 }
 
 export async function POST(req: Request) {

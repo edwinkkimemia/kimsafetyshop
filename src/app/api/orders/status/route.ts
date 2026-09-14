@@ -31,7 +31,18 @@ export async function GET(req: Request) {
   const token = searchParams.get("token") ?? "";
   if (!orderId || !token) return NextResponse.json({ error: "Missing orderId or token" }, { status: 400 });
 
-  const order = await getOrderById(orderId);
+  let order: Awaited<ReturnType<typeof getOrderById>>;
+  try {
+    order = await getOrderById(orderId);
+  } catch (err) {
+    const msg = (err as Error)?.message ?? "";
+    const code = (err as { code?: string })?.code;
+    if (code === "53300" || /too many connections/i.test(msg)) {
+      // Under load don't 500 — tell checkout to keep polling (transient)
+      return NextResponse.json({ paid: 0, transient: true, retryAfterMs: 5000 }, { headers: { "Cache-Control": "no-store" } });
+    }
+    throw err;
+  }
   if (!order) return NextResponse.json({ error: "Order not found" }, { status: 404 });
   if (!order.payment_token || token !== order.payment_token) {
     return NextResponse.json({ error: "Invalid payment token" }, { status: 403 });

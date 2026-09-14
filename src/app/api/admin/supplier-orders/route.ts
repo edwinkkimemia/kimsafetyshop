@@ -8,9 +8,13 @@ export const runtime = "nodejs";
 export async function GET() {
   const denied = await requireAdmin();
   if (denied) return denied;
-  return NextResponse.json({
-    orders: (await listSupplierOrders()).map((o) => ({ ...o, items: JSON.parse(o.items) })),
-  });
+  try {
+    const rows = await listSupplierOrders().catch(() => [] as Awaited<ReturnType<typeof listSupplierOrders>>);
+    return NextResponse.json({ orders: rows.map((o) => ({ ...o, items: JSON.parse(o.items) })) });
+  } catch (err) {
+    console.error("[admin/supplier-orders] error:", (err as Error).message);
+    return NextResponse.json({ orders: [] });
+  }
 }
 
 export async function POST(req: Request) {

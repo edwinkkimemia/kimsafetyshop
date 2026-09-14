@@ -74,17 +74,20 @@ export function StoreProvider({ children }: { children: ReactNode }) {
       })
       .catch(() => setCatalog([]));
     // Public settings endpoint — powers the delivery fee / free-shipping text.
-    fetch("/api/settings")
-      .then((r) => r.json())
-      .then((j) => {
-        const fee = Number(j?.settings?.delivery_fee);
-        const threshold = Number(j?.settings?.free_delivery_threshold);
-        setDelivery({
-          fee: Number.isFinite(fee) && fee >= 0 ? fee : 350,
-          threshold: Number.isFinite(threshold) && threshold >= 0 ? threshold : 10000,
-        });
-      })
-      .catch(() => {});
+    // Reuse the shared settings fetcher (dedupes with useSettings) to avoid
+    // the double /api/settings stampede seen at 17:44:36 (2× at same ms).
+    import("@/lib/settings").then(({ fetchSettings }) =>
+      fetchSettings()
+        .then((s) => {
+          const fee = Number(s?.delivery_fee);
+          const threshold = Number(s?.free_delivery_threshold);
+          setDelivery({
+            fee: Number.isFinite(fee) && fee >= 0 ? fee : 350,
+            threshold: Number.isFinite(threshold) && threshold >= 0 ? threshold : 10000,
+          });
+        })
+        .catch(() => {})
+    );
   }, []);
 
   // Re-fetches the live catalog so cart/checkout prices reflect admin price
@@ -100,25 +103,34 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  // Keeps listing pages (search/home/category carousels) honest while a visitor
-  // browses without a full reload: re-fetch when the tab is focused or becomes
-  // visible, and at a slow interval. The server caches /api/catalog for 5s, so
-  // this stays cheap while making admin price/image edits appear within a minute.
+  // Keeps listing pages honest while browsing without reload. Uses a longer
+  // 2-minute interval and debounced focus handling to avoid the stampede seen
+  // in logs (4× /api/settings at the same ms when tab regains focus).
   useEffect(() => {
     let pending = false;
+    let lastSync = 0;
+    const MIN_SYNC_GAP_MS = 120_000; // don't re-fetch catalog more than every 2 min
     const sync = () => {
+      const now = Date.now();
       if (pending || document.visibilityState !== "visible") return;
+      if (now - lastSync < MIN_SYNC_GAP_MS) return;
       pending = true;
+      lastSync = now;
       refreshCatalog().finally(() => {
         pending = false;
       });
     };
-    const onFocus = () => sync();
-    const iv = setInterval(sync, 60_000);
+    let focusDebounce: ReturnType<typeof setTimeout> | null = null;
+    const onFocus = () => {
+      if (focusDebounce) clearTimeout(focusDebounce);
+      focusDebounce = setTimeout(sync, 1500); // debounce rapid focus/visibility bursts
+    };
+    const iv = setInterval(sync, 120_000);
     window.addEventListener("focus", onFocus);
     document.addEventListener("visibilitychange", onFocus);
     return () => {
       clearInterval(iv);
+      if (focusDebounce) clearTimeout(focusDebounce);
       window.removeEventListener("focus", onFocus);
       document.removeEventListener("visibilitychange", onFocus);
     };

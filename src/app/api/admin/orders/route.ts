@@ -49,36 +49,51 @@ export async function GET(req: Request) {
   const denied = await requireAdmin();
   if (denied) return denied;
 
-  const { searchParams } = new URL(req.url);
-  const id = searchParams.get("id");
-  if (id) {
-    const order = await getOrderById(id);
-    if (!order) return NextResponse.json({ error: "Order not found" }, { status: 404 });
-    return NextResponse.json({ order: await withItems(order) });
-  }
-
-  const userId = searchParams.get("userId");
-  if (userId) {
-    let targetUser = await getUserById(userId);
-    if (!targetUser) {
-      const allUsers = await listUsers();
-      const lower = userId.toLowerCase();
-      const found = allUsers.find((u) => u.id === userId) ?? allUsers.find((u) => u.referral_code?.toLowerCase() === lower) ?? allUsers.find((u) => u.id.toLowerCase().startsWith(lower));
-      if (found) targetUser = await getUserById(found.id);
+  try {
+    const { searchParams } = new URL(req.url);
+    const id = searchParams.get("id");
+    if (id) {
+      const order = await getOrderById(id).catch(() => undefined);
+      if (!order) return NextResponse.json({ error: "Order not found" }, { status: 404 });
+      return NextResponse.json({ order: await withItems(order) });
     }
-    if (!targetUser) return NextResponse.json({ error: "User not found" }, { status: 404 });
-    const all = await listOrders();
-    const emailLower = targetUser.email.toLowerCase();
-    const realId = targetUser.id;
-    const filtered = all.filter(
-      (o) => o.user_id === realId || (!o.user_id && o.email.toLowerCase() === emailLower) || o.email.toLowerCase() === emailLower
-    );
-    const orders = await Promise.all(filtered.map(withItems));
-    return NextResponse.json({ orders, user: { id: targetUser.id, name: targetUser.name, email: targetUser.email } });
-  }
 
-  const orders = await Promise.all((await listOrders()).map(withItems));
-  return NextResponse.json({ orders });
+    const userId = searchParams.get("userId");
+    if (userId) {
+      let targetUser: Awaited<ReturnType<typeof getUserById>> | undefined;
+      try {
+        targetUser = await getUserById(userId);
+      } catch {}
+      if (!targetUser) {
+        try {
+          const allUsers = await listUsers().catch(() => [] as Awaited<ReturnType<typeof listUsers>>);
+          const lower = userId.toLowerCase();
+          const found = allUsers.find((u) => u.id === userId) ?? allUsers.find((u) => u.referral_code?.toLowerCase() === lower) ?? allUsers.find((u) => u.id.toLowerCase().startsWith(lower));
+          if (found) targetUser = await getUserById(found.id).catch(() => undefined);
+        } catch {}
+      }
+      if (!targetUser) return NextResponse.json({ error: "User not found" }, { status: 404 });
+      const all = await listOrders().catch(() => [] as Awaited<ReturnType<typeof listOrders>>);
+      const emailLower = targetUser.email.toLowerCase();
+      const realId = targetUser.id;
+      const filtered = all.filter(
+        (o) => o.user_id === realId || (!o.user_id && o.email.toLowerCase() === emailLower) || o.email.toLowerCase() === emailLower
+      );
+      // Limit enrichment to avoid N-catalog fetches under 53300; withItems uses liveCatalog inflight dedupe but still heavy.
+      const slice = filtered.slice(0, 100);
+      const orders = await Promise.all(slice.map(withItems));
+      return NextResponse.json({ orders, user: { id: targetUser.id, name: targetUser.name, email: targetUser.email } });
+    }
+
+    // Full orders table scan — cap to recent 100 to bound DB + catalog pressure under burst.
+    const all = await listOrders().catch(() => [] as Awaited<ReturnType<typeof listOrders>>);
+    const recent = all.slice(0, 100);
+    const orders = await Promise.all(recent.map(withItems));
+    return NextResponse.json({ orders });
+  } catch (err) {
+    console.error("[admin/orders] GET error:", (err as Error).message);
+    return NextResponse.json({ orders: [] });
+  }
 }
 
 export async function PATCH(req: Request) {

@@ -5,7 +5,13 @@ import { requireAdmin } from "@/lib/api-helpers";
 export async function GET() {
   const denied = await requireAdmin();
   if (denied) return denied;
-  return NextResponse.json({ reviews: await listAllReviews() });
+  try {
+    const reviews = await listAllReviews().catch(() => [] as Awaited<ReturnType<typeof listAllReviews>>);
+    return NextResponse.json({ reviews });
+  } catch (err) {
+    console.error("[admin/reviews] error:", (err as Error).message);
+    return NextResponse.json({ reviews: [] });
+  }
 }
 
 export async function PATCH(req: Request) {

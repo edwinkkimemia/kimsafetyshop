@@ -9,20 +9,59 @@ const VALID = ["Requested", "Approved", "Rejected", "Picked up", "Refunded", "Cl
 export async function GET() {
   const denied = await requireAdmin();
   if (denied) return denied;
-  const returns = await listAllReturns();
-  // Enrich with the customer's email + name (for replies) and the order reference.
-  const enriched = await Promise.all(
-    returns.map(async (r) => {
-      const order = await getOrderById(r.order_id);
-      const account = order?.user_id ? await getUserById(order.user_id) : undefined;
-      return {
-        ...r,
-        customer_name: account?.name ?? order?.name ?? null,
-        customer_email: account?.email ?? order?.email ?? null,
-      };
-    })
-  );
-  return NextResponse.json({ returns: enriched });
+  try {
+    const returns = await listAllReturns().catch(() => [] as Awaited<ReturnType<typeof listAllReturns>>);
+    if (returns.length === 0) return NextResponse.json({ returns: [] });
+    // N+1 storm: previously Promise.all per-return did getOrderById + getUserById
+    // (2*N concurrent DB queries). Batch via single JOIN query instead of N fetches.
+    // Fallback to per-row try/catch on 53300 so one failure doesn't abort all.
+    let enriched: typeof returns;
+    try {
+      // Try batched enrichment with JOINs (1 query)
+      const { qr } = await import("@/lib/db");
+      const ids = returns.map((r) => r.order_id);
+      if (ids.length > 0) {
+        const placeholders = ids.map((_, i) => `$${i + 1}`).join(",");
+        const rows = (await qr(
+          `SELECT o.id AS oid, o.name AS oname, o.email AS oemail, o.user_id, u.name AS uname, u.email AS uemail
+           FROM orders o LEFT JOIN users u ON u.id = o.user_id WHERE o.id IN (${placeholders})`,
+          ...ids
+        ).catch(() => [])) as { oid: string; oname: string; oemail: string; user_id: string | null; uname: string | null; uemail: string | null }[];
+        const m = new Map(rows.map((r) => [r.oid, r]));
+        enriched = returns.map((r) => {
+          const j = m.get(r.order_id);
+          return {
+            ...r,
+            customer_name: (j?.uname ?? j?.oname ?? null) as string | null,
+            customer_email: (j?.uemail ?? j?.oemail ?? null) as string | null,
+          };
+        }) as typeof returns;
+      } else {
+        enriched = returns.map((r) => ({ ...r, customer_name: null, customer_email: null })) as typeof returns;
+      }
+    } catch {
+      // Fallback sequential with catch per item
+      enriched = (await Promise.all(
+        returns.map(async (r) => {
+          try {
+            const order = await getOrderById(r.order_id).catch(() => undefined);
+            const account = order?.user_id ? await getUserById(order.user_id).catch(() => undefined) : undefined;
+            return {
+              ...r,
+              customer_name: (account?.name ?? order?.name ?? null) as string | null,
+              customer_email: (account?.email ?? order?.email ?? null) as string | null,
+            };
+          } catch {
+            return { ...r, customer_name: null, customer_email: null } as typeof r & { customer_name: null; customer_email: null };
+          }
+        })
+      )) as typeof returns;
+    }
+    return NextResponse.json({ returns: enriched });
+  } catch (err) {
+    console.error("[admin/returns] error:", (err as Error).message);
+    return NextResponse.json({ returns: [] });
+  }
 }
 
 export async function PATCH(req: Request) {

@@ -14,16 +14,22 @@ export async function GET(req: Request) {
   const denied = await requireAdmin();
   if (denied) return denied;
 
-  const { searchParams } = new URL(req.url);
-  const thread = searchParams.get("thread");
-  if (thread) {
-    const ticket = await getTicket(thread);
-    if (!ticket) return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
-    return NextResponse.json({ ticket, replies: await listTicketReplies(thread) });
-  }
+  try {
+    const { searchParams } = new URL(req.url);
+    const thread = searchParams.get("thread");
+    if (thread) {
+      const ticket = await getTicket(thread).catch(() => undefined);
+      if (!ticket) return NextResponse.json({ error: "Ticket not found" }, { status: 404 });
+      const replies = await listTicketReplies(thread).catch(() => [] as Awaited<ReturnType<typeof listTicketReplies>>);
+      return NextResponse.json({ ticket, replies });
+    }
 
-  const tickets = await listAllTickets();
-  return NextResponse.json({ tickets });
+    const tickets = await listAllTickets().catch(() => [] as Awaited<ReturnType<typeof listAllTickets>>);
+    return NextResponse.json({ tickets });
+  } catch (err) {
+    console.error("[admin/tickets] error:", (err as Error).message);
+    return NextResponse.json({ tickets: [] });
+  }
 }
 
 export async function POST(req: Request) {

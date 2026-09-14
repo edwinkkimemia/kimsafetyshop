@@ -6,12 +6,13 @@ import { slugify } from "@/lib/utils";
 import type { Product } from "@/lib/types";
 import path from "path";
 
-// The admin product table only changes on admin edits. Short TTL ensures
-// admin image/price edits appear within seconds on Vercel where each lambda
-// has its own in-memory cache (invalidate on one instance doesn't bust others).
-// 5s keeps storefront snappy while making Vercel edits visible on refresh.
-const CATALOG_TTL_MS = 5 * 1000;
-const DB_FAIL_TTL_MS = 10 * 1000;
+// Admin product table changes only on admin edits. Previously 5s TTL caused
+// every Lambda to hit Postgres every 5s — under burst (Vercel = many Lambdas)
+// this saturates the `prisma_migration` connection limit (53300).
+// 30s TTL + stale-while-revalidate keeps edits visible within ~30s while
+// cutting DB QPS by 6×. On 53300 we back off 30s and serve static catalog.
+const CATALOG_TTL_MS = 30 * 1000;
+const DB_FAIL_TTL_MS = 30 * 1000;
 let cachedAdminRows: { at: number; rows: Awaited<ReturnType<typeof listAdminProducts>> } | null = null;
 let lastDbFailAt = 0;
 
@@ -19,7 +20,10 @@ export async function getCachedAdminRows(): Promise<Awaited<ReturnType<typeof li
   const now = Date.now();
   if (cachedAdminRows && now - cachedAdminRows.at < CATALOG_TTL_MS) return cachedAdminRows.rows;
   // After a failure, back off briefly so an overloaded DB is not hammered.
-  if (now - lastDbFailAt < DB_FAIL_TTL_MS) return null;
+  if (now - lastDbFailAt < DB_FAIL_TTL_MS) {
+    // Serve stale if we have it, otherwise signal caller to use static catalog.
+    return cachedAdminRows?.rows ?? null;
+  }
   try {
     const rows = await listAdminProducts();
     cachedAdminRows = { at: now, rows };
@@ -27,7 +31,8 @@ export async function getCachedAdminRows(): Promise<Awaited<ReturnType<typeof li
   } catch (err) {
     lastDbFailAt = Date.now();
     console.error("[catalog] admin rows fetch failed, serving static catalog:", (err as Error).message);
-    return null;
+    // Return stale on transient failure so storefront never 500s under 53300.
+    return cachedAdminRows?.rows ?? null;
   }
 }
 
@@ -39,7 +44,7 @@ export function invalidateCatalogCache() {
 }
 
 let cachedBlocked: { at: number; set: Set<string> } | null = null;
-const BLOCKED_TTL_MS = 30 * 1000;
+const BLOCKED_TTL_MS = 60 * 1000;
 
 async function getBlockedSet(): Promise<Set<string>> {
   const now = Date.now();
@@ -77,7 +82,7 @@ export async function addBlockedImages(filenames: string[]) {
 }
 
 let cachedDeleted: { at: number; set: Set<string> } | null = null;
-const DELETED_TTL_MS = 30 * 1000;
+const DELETED_TTL_MS = 60 * 1000;
 
 async function getDeletedSet(): Promise<Set<string>> {
   const now = Date.now();

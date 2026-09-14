@@ -5,19 +5,21 @@ import { createUser, deleteUser, listUsers, setUserRole, setUserVerified, getUse
 export async function GET(req: Request) {
   const denied = await requireAdmin();
   if (denied) return denied;
-  const me = await getSessionUser();
-  const isSuper = me?.role === "superadmin";
-  const { searchParams } = new URL(req.url);
-  const id = searchParams.get("id");
-  // Staff picker for corporate manager — allow any admin to list staff
-  if (searchParams.get("staff") === "1") {
-    const allForStaff = await listUsers();
-    const staff = allForStaff
-      .filter((u) => u.role === "admin" || u.role === "superadmin")
-      .map((u) => ({ id: u.id, name: u.name, email: u.email, role: u.role, referral_code: u.referral_code }));
-    return NextResponse.json({ users: staff });
-  }
-  const all = await listUsers();
+  try {
+    const me = await getSessionUser();
+    const isSuper = me?.role === "superadmin";
+    const { searchParams } = new URL(req.url);
+    const id = searchParams.get("id");
+    // Staff picker for corporate manager — allow any admin to list staff
+    if (searchParams.get("staff") === "1") {
+      const allForStaff = await listUsers().catch(() => [] as Awaited<ReturnType<typeof listUsers>>);
+      const staff = allForStaff
+        .filter((u) => u.role === "admin" || u.role === "superadmin")
+        .map((u) => ({ id: u.id, name: u.name, email: u.email, role: u.role, referral_code: u.referral_code }));
+      return NextResponse.json({ users: staff });
+    }
+    const all = await listUsers().catch(() => [] as Awaited<ReturnType<typeof listUsers>>);
+    if (all.length === 0) return NextResponse.json({ users: [] });
   const byId = new Map(all.map((u) => [u.id, u.name]));
   // Build corporate lookup (by user_id and by email fallback for accounts without user_id or legacy mismatches)
   const corpByUserId = new Map<string, { id: string; company: string; discount_rate: number; credit_terms: string; status: string; account_manager: string | null; email: string | null }>();
@@ -97,6 +99,10 @@ export async function GET(req: Request) {
     referred_by_name: u.referred_by ? (byId.get(u.referred_by) ?? null) : null,
   }));
   return NextResponse.json({ users: usersWithReferrer });
+  } catch (err) {
+    console.error("[admin/users] GET error:", (err as Error).message);
+    return NextResponse.json({ users: [] });
+  }
 }
 
 export async function POST(req: Request) {

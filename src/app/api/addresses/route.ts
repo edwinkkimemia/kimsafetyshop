@@ -5,7 +5,13 @@ import { getSessionUser } from "@/lib/api-helpers";
 export async function GET() {
   const user = await getSessionUser();
   if (!user) return NextResponse.json({ error: "Not authenticated" }, { status: 401 });
-  return NextResponse.json({ addresses: await listAddressesForUser(user.id) });
+  try {
+    const addresses = await listAddressesForUser(user.id).catch(() => [] as Awaited<ReturnType<typeof listAddressesForUser>>);
+    return NextResponse.json({ addresses });
+  } catch (err) {
+    console.error("[addresses] error:", (err as Error).message);
+    return NextResponse.json({ addresses: [] });
+  }
 }
 
 export async function POST(req: Request) {
